@@ -378,6 +378,206 @@ func notifier interface{
     }
     ```
 
-    - 有两种channel，分别是无缓冲的和有缓冲的
+    - 有两种channel，分别是无缓冲的和有缓冲的s
       - 无缓冲：传、取时都会阻塞，直到有另外的goroutine向这个管道取或传，传取双方都必须准备好，创建方法就是上面这种
       - 有缓冲：`messages := make(chan string, num)`，num表示容量，如果channel关闭，依然可以取出内容但是不可以再向里面放
+
+
+
+### 并发模式：资源池
+
+使用一个有缓冲的channel来实现一个资源池，用于在并发的goroutine之间共享资源
+
+- 资源池的声明：
+
+  - 包含资源池基本属性：创建资源的工厂（一个方法），类型为资源的带缓冲的channel，互斥锁对象
+
+  - 构造方法：传入创建资源的工厂方法、资源池大小，把工厂方法返回的资源放入资源池，返回一个资源池引用。
+
+    ```go
+    //新建资源池
+    func New(fn func() (io.Closer, error), size int) (*Pool, error) {
+        if size <= 0 {
+            return nil, errors.New("新建资源池大小太小")
+        }
+        //新建资源池
+        p := Pool{
+            factory:  fn,
+            resource: make(chan io.Closer, size),
+        }
+        //向资源池循环添加资源，直到池满
+        for count := 1; count <= cap(p.resource); count++ {
+            r, err := fn()
+            if err != nil {
+                log.Println("添加资源失败，创建资源方法返回nil")
+                break
+            }
+            log.Println("资源加入资源池")
+            p.resource <- r
+        }
+        log.Println("资源池已满，返回资源池")
+        return &p, nil
+    }
+    ```
+
+  - 获取资源、释放资源、关闭资源池
+
+
+
+### 协程池
+
+为了限制同时创建过多goroutine，提供一个 goroutine 池，每个 goroutine 循环阻塞等待从任务池中执行任务；外界使用者不断的往任务池里丢任务，则 goroutine 池中的多个 goroutine 会并发的处理这些任务。
+
+- 创建一个goroutine池，包含一个内容为任务接口的channel
+
+  ```go
+  type Worker interface {
+      Task()
+  }
+  
+  type Pool struct {
+      wg sync.WaitGroup
+      // 工作池
+      taskPool chan Worker
+  }
+  
+  //假设有maxGoroutineNum个goroutine被创建出来,那么也会因为没办法10个goroutine同时从channel里获得任务去执行
+  func New(maxGoroutineNum int) *Pool {
+      // 1. 初始化一个 Pool
+      p := Pool{
+          taskPool: make(chan Worker),
+      }
+  
+      p.wg.Add(maxGoroutineNum)
+      // 2. 创建 maxGoroutineNum 个 goroutine，并发的从 taskPool 中获取任务
+      for i := 0; i < maxGoroutineNum; i++ {
+          go func() {
+              for task := range p.taskPool {
+                  // 3. 执行任务
+                  task.Task()
+              }
+              p.wg.Done()
+          }()
+      }
+      return &p
+  }
+  ```
+
+- 提交任务
+
+  ```go
+  func (p *Pool) Run(worker Worker) {
+      p.taskPool <- worker
+  }
+  ```
+
+- 这个过程就像是一个房间里有两个篮子，你放了10个工人进去，外面有人放苹果进篮子里，工人就会抢这个苹果去加工
+
+  ```go
+  package main
+  
+  import (
+          "fmt"
+          "time"
+  )
+  
+  /* 有关Task任务相关定义及操作 */
+  //定义任务Task类型,每一个任务Task都可以抽象成一个函数
+  type Task struct {
+          f func() error //一个无参的函数类型
+  }
+  
+  //通过NewTask来创建一个Task
+  func NewTask(f func() error) *Task {
+          t := Task{
+                  f: f,
+          }
+  
+          return &t
+  }
+  
+  //执行Task任务的方法
+  func (t *Task) Execute() {
+          t.f() //调用任务所绑定的函数
+  }
+  
+  /* 有关协程池的定义及操作 */
+  //定义池类型
+  type Pool struct {
+          //对外接收Task的入口
+          EntryChannel chan *Task
+  
+          //协程池最大worker数量,限定Goroutine的个数
+          worker_num int
+  
+          //协程池内部的任务就绪队列
+          JobsChannel chan *Task
+  }
+  
+  //创建一个协程池
+  func NewPool(cap int) *Pool {
+          p := Pool{
+                  EntryChannel: make(chan *Task),
+                  worker_num:   cap,
+                  JobsChannel:  make(chan *Task),
+          }
+  
+          return &p
+  }
+  
+  //协程池创建一个worker并且开始工作
+  func (p *Pool) worker(work_ID int) {
+          //worker不断的从JobsChannel内部任务队列中拿任务
+          for task := range p.JobsChannel {
+                  //如果拿到任务,则执行task任务
+                  task.Execute()
+                  fmt.Println("worker ID ", work_ID, " 执行完毕任务")
+          }
+  }
+  
+  //让协程池Pool开始工作
+  func (p *Pool) Run() {
+          //1,首先根据协程池的worker数量限定,开启固定数量的Worker,
+          //  每一个Worker用一个Goroutine承载
+          for i := 0; i < p.worker_num; i++ {
+                  go p.worker(i)
+          }
+  
+          //2, 从EntryChannel协程池入口取外界传递过来的任务
+          //   并且将任务送进JobsChannel中
+          for task := range p.EntryChannel {
+                  p.JobsChannel <- task
+          }
+  
+          //3, 执行完毕需要关闭JobsChannel
+          close(p.JobsChannel)
+  
+          //4, 执行完毕需要关闭EntryChannel
+          close(p.EntryChannel)
+  }
+  
+  //主函数
+  func main() {
+          //创建一个Task
+          t := NewTask(func() error {
+                  fmt.Println(time.Now())
+                  return nil
+          })
+  
+          //创建一个协程池,最大开启3个协程worker
+          p := NewPool(3)
+  
+          //开一个协程 不断的向 Pool 输送打印一条时间的task任务
+          go func() {
+                  for {
+                          p.EntryChannel <- t
+                  }
+          }()
+  
+          //启动协程池p
+          p.Run()
+  
+  }
+  ```
+
+  
